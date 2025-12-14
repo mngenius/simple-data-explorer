@@ -21,7 +21,8 @@ def test_query_execution_validation(client: TestClient):
     }
     
     response = client.post("/api/v1/query/execute", json=query)
-    assert response.status_code == 400  # Validation error for dataset not found
+    # Returns 400 because validation error is treated as bad request
+    assert response.status_code == 400
 
 
 def test_query_request_validation(client: TestClient):

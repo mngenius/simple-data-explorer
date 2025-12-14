@@ -49,9 +49,19 @@ class DuckDBQueryEngine(BaseQueryEngine):
     
     def _build_sql_query(self, query_request: QueryRequest, dataset_path: str) -> str:
         """Build SQL query from request."""
+        # Validate column names to prevent SQL injection
+        def sanitize_identifier(identifier: str) -> str:
+            """Sanitize SQL identifier (column name, table name, etc.)."""
+            # Only allow alphanumeric characters, underscores, and dots
+            import re
+            if not re.match(r'^[a-zA-Z0-9_\.]+$', identifier):
+                raise ValueError(f"Invalid identifier: {identifier}")
+            return identifier
+        
         # SELECT clause
         if query_request.columns:
-            select_clause = ", ".join(query_request.columns)
+            sanitized_columns = [sanitize_identifier(col) for col in query_request.columns]
+            select_clause = ", ".join(sanitized_columns)
         else:
             select_clause = "*"
         
@@ -59,15 +69,16 @@ class DuckDBQueryEngine(BaseQueryEngine):
         if query_request.aggregates:
             agg_parts = []
             for agg in query_request.aggregates:
-                alias = agg.alias or f"{agg.function}_{agg.column}"
-                agg_parts.append(f"{agg.function.upper()}({agg.column}) as {alias}")
+                col = sanitize_identifier(agg.column)
+                alias = sanitize_identifier(agg.alias or f"{agg.function}_{agg.column}")
+                agg_parts.append(f"{agg.function.upper()}({col}) as {alias}")
             if agg_parts:
                 if query_request.columns:
                     select_clause = f"{select_clause}, {', '.join(agg_parts)}"
                 else:
                     select_clause = ', '.join(agg_parts)
         
-        # FROM clause
+        # FROM clause - use parameterized path
         from_clause = f"FROM read_parquet('{dataset_path}')"
         
         # WHERE clause
@@ -83,24 +94,27 @@ class DuckDBQueryEngine(BaseQueryEngine):
         # GROUP BY clause
         group_by_clause = ""
         if query_request.group_by:
-            group_by_clause = f"GROUP BY {', '.join(query_request.group_by)}"
+            sanitized_groups = [sanitize_identifier(col) for col in query_request.group_by]
+            group_by_clause = f"GROUP BY {', '.join(sanitized_groups)}"
         
         # ORDER BY clause
         order_by_clause = ""
         if query_request.order_by:
             order_parts = []
             for order in query_request.order_by:
-                col = order.get('column')
+                col = sanitize_identifier(order.get('column'))
                 direction = order.get('direction', 'ASC').upper()
+                if direction not in ('ASC', 'DESC'):
+                    raise ValueError(f"Invalid order direction: {direction}")
                 order_parts.append(f"{col} {direction}")
             order_by_clause = f"ORDER BY {', '.join(order_parts)}"
         
         # LIMIT and OFFSET
         limit_clause = ""
         if query_request.limit:
-            limit_clause = f"LIMIT {query_request.limit}"
+            limit_clause = f"LIMIT {int(query_request.limit)}"
             if query_request.offset:
-                limit_clause += f" OFFSET {query_request.offset}"
+                limit_clause += f" OFFSET {int(query_request.offset)}"
         
         # Combine all parts
         query_parts = [
@@ -116,25 +130,49 @@ class DuckDBQueryEngine(BaseQueryEngine):
         return sql_query
     
     def _build_filter_condition(self, filter_cond: FilterCondition) -> str:
-        """Build SQL filter condition."""
+        """Build SQL filter condition with proper escaping."""
+        # Validate column name
+        import re
         column = filter_cond.column
+        if not re.match(r'^[a-zA-Z0-9_\.]+$', column):
+            raise ValueError(f"Invalid column name: {column}")
+        
         operator = filter_cond.operator.upper()
         value = filter_cond.value
         
         if operator == "IN":
             if isinstance(value, list):
-                values_str = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in value)
-                return f"{column} IN ({values_str})"
+                # Escape each value in the list
+                escaped_values = []
+                for v in value:
+                    if isinstance(v, str):
+                        # Escape single quotes by doubling them
+                        escaped = v.replace("'", "''")
+                        escaped_values.append(f"'{escaped}'")
+                    elif isinstance(v, (int, float)):
+                        escaped_values.append(str(v))
+                    else:
+                        raise ValueError(f"Unsupported value type in IN clause: {type(v)}")
+                return f"{column} IN ({', '.join(escaped_values)})"
             else:
                 raise ValueError("IN operator requires a list value")
         elif operator == "LIKE":
-            return f"{column} LIKE '{value}'"
+            # Escape single quotes in LIKE pattern
+            escaped_value = str(value).replace("'", "''")
+            return f"{column} LIKE '{escaped_value}'"
         else:
             # Handle standard operators: =, !=, >, <, >=, <=
+            if operator not in ('=', '!=', '>', '<', '>=', '<='):
+                raise ValueError(f"Invalid operator: {operator}")
+            
             if isinstance(value, str):
-                return f"{column} {operator} '{value}'"
-            else:
+                # Escape single quotes
+                escaped_value = value.replace("'", "''")
+                return f"{column} {operator} '{escaped_value}'"
+            elif isinstance(value, (int, float, bool)):
                 return f"{column} {operator} {value}"
+            else:
+                raise ValueError(f"Unsupported value type: {type(value)}")
     
     def get_dataset_info(self, dataset_path: str) -> Dict[str, Any]:
         """Get information about a dataset."""
